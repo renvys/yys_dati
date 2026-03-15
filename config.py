@@ -52,6 +52,18 @@ SECRETS_EXAMPLE_PATH = _find_runtime_file("secrets.json.example")
 SECRETS_WARNING = ""
 
 
+def _append_secrets_warning(message: str) -> None:
+    """追加 secrets 相关提示，避免后面的检查覆盖前面的信息。"""
+    global SECRETS_WARNING
+    if not message:
+        return
+    if not SECRETS_WARNING:
+        SECRETS_WARNING = message
+        return
+    if message not in SECRETS_WARNING:
+        SECRETS_WARNING = f"{SECRETS_WARNING}\n{message}"
+
+
 def _load_secrets() -> dict:
     """从 secrets.json 加载敏感配置；缺失时返回空配置。"""
     global SECRETS_WARNING
@@ -62,18 +74,18 @@ def _load_secrets() -> dict:
                 shutil.copyfile(SECRETS_EXAMPLE_PATH, SECRETS_PATH)
                 SECRETS_WARNING = (
                     f"已自动创建配置模板: {SECRETS_PATH}，"
-                    "请按需填入豆包 API key；当前若未填写将自动回退传统 OCR。"
+                    "请填入 doubao_api_key 和 doubao_model（接入点 ID）。"
                 )
             except OSError:
                 SECRETS_WARNING = (
                     f"配置文件不存在: {SECRETS_PATH}；"
-                    f"可复制 {SECRETS_EXAMPLE_PATH.name} 为 secrets.json 并填入豆包 API key。"
+                    f"可复制 {SECRETS_EXAMPLE_PATH.name} 为 secrets.json 并填入 doubao_api_key 和 doubao_model。"
                 )
                 return {}
         else:
             SECRETS_WARNING = (
                 f"配置文件不存在: {SECRETS_PATH}；"
-                "当前若未配置豆包 API key，将自动回退传统 OCR。"
+                "请创建 secrets.json 并填入 doubao_api_key 和 doubao_model。"
             )
             return {}
 
@@ -83,7 +95,7 @@ def _load_secrets() -> dict:
     except json.JSONDecodeError as e:
         SECRETS_WARNING = (
             f"配置文件格式错误: {SECRETS_PATH} ({e})；"
-            "当前若未配置豆包 API key，将自动回退传统 OCR。"
+            "请检查 doubao_api_key 和 doubao_model 配置。"
         )
         return {}
 
@@ -125,9 +137,9 @@ OCR_OPTION_CONFIDENCE_THRESHOLD = 0.20
 
 # 豆包视觉理解 API（可选，用于直接看图识别题目和答案）
 USE_DOUBAO_VISION = True
-DOUBAO_API_KEY = _SECRETS.get("doubao_api_key", "")
+DOUBAO_API_KEY = str(_SECRETS.get("doubao_api_key", "") or "").strip()
 DOUBAO_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
-DOUBAO_MODEL = "ep-20260313205708-qnj75"
+DOUBAO_MODEL = str(_SECRETS.get("doubao_model", "") or "").strip()
 DOUBAO_TIMEOUT = 30
 DOUBAO_MIN_INTERVAL = 0.6
 DOUBAO_TRIGGER_STABLE_FRAMES = 2
@@ -135,6 +147,12 @@ DOUBAO_HASH_SIZE = 12
 DOUBAO_HASH_DISTANCE_THRESHOLD = 6
 DOUBAO_CACHE_SIZE = 32
 DEBUG_LOGS = True
+
+if not DOUBAO_API_KEY:
+    _append_secrets_warning("未配置 doubao_api_key。")
+
+if not DOUBAO_MODEL:
+    _append_secrets_warning("未配置 doubao_model（接入点 ID，例如 ep-xxxxxx）。")
 
 # ============================================================
 # 匹配

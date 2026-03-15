@@ -86,7 +86,7 @@ pip install -r requirements.txt
 - `USE_DOUBAO_VISION`
   - 是否启用豆包视觉识别
 - `DOUBAO_*`
-  - 豆包模型、接口地址、超时、触发间隔等
+  - 豆包接入点、接口地址、超时、触发间隔等
 - `CLICK_MODE`
   - 点击后端，当前默认 `mumu_adb`
 - `MUMU_ADB_PATH`
@@ -102,23 +102,33 @@ pip install -r requirements.txt
 
 ```json
 {
-  "doubao_api_key": "your-api-key-here"
+  "doubao_api_key": "your-api-key-here",
+  "doubao_model": "ep-your-endpoint-id"
 }
 ```
 
-API Key 申请方式：
+配置说明：
+
+- `doubao_api_key`
+  - 火山引擎在线推理使用的 API Key
+- `doubao_model`
+  - 你创建好的自定义推理接入点 ID，通常形如 `ep-xxxxxx`
+  - 这里填写的是接入点 ID，不是直接填写 `Doubao-1.5-vision-pro-32k`
+
+申请与创建方式：
 
 1. 打开 [火山引擎控制台](https://console.volcengine.com/)
 2. 进入“在线推理”
 3. 创建“自定义推理接入点”
 4. 在“指定单一模型”中选择 `Doubao-1.5-vision-pro-32k`
-5. 创建完成后，将对应 API Key 填入 `secrets.json`
+5. 创建完成后，记录 API Key 和接入点 ID
+6. 将它们填入 `secrets.json`
 
 说明：
 
 - 开发环境下缺少 `secrets.json` 时，可以手动复制模板后填写。
 - 打包后的程序若缺少该文件，会尝试自动生成模板。
-- 未配置有效豆包 API Key 时，程序无法按推荐方式正常使用。
+- 未配置有效的 `doubao_api_key` 或 `doubao_model` 时，程序无法按预期正常使用。
 
 ## 运行
 
@@ -235,7 +245,7 @@ yys_dati/
 
 ### 没有配置豆包 API Key 会怎样
 
-程序无法按预期正常使用，应先补齐 `secrets.json` 并填入可用的豆包 API Key。
+程序无法按预期正常使用，应先补齐 `secrets.json` 并填入可用的 `doubao_api_key` 和 `doubao_model`。
 
 ### 为什么打包后体积依然不小
 

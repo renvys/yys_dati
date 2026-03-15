@@ -163,14 +163,15 @@ class QuizBot:
         if use_doubao:
             self.gui.log("正在初始化豆包视觉识别...")
             doubao_api_key = getattr(config, "DOUBAO_API_KEY", "")
-            if not doubao_api_key:
-                self.gui.log("警告：未配置 DOUBAO_API_KEY，将使用传统 OCR 模式")
+            doubao_model = getattr(config, "DOUBAO_MODEL", "")
+            if not doubao_api_key or not doubao_model:
+                self.gui.log("警告：未完整配置 doubao_api_key 或 doubao_model，将使用传统 OCR 模式")
                 use_doubao = False
             else:
                 self.doubao_vision = DoubaoVision(
                     api_key=doubao_api_key,
                     base_url=getattr(config, "DOUBAO_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3"),
-                    model=getattr(config, "DOUBAO_MODEL", "doubao-seed-1-8-251228"),
+                    model=doubao_model,
                     timeout=getattr(config, "DOUBAO_TIMEOUT", 30),
                     min_interval=getattr(config, "DOUBAO_MIN_INTERVAL", 1.0),
                 )
