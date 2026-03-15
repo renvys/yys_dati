@@ -1,4 +1,4 @@
-"""游戏窗口管理与截图工具。"""
+﻿"""游戏窗口管理与截图工具。"""
 
 import ctypes
 import json
@@ -62,6 +62,7 @@ class WindowManager:
         self._preferred_window_title = ""
         self._pid_name_cache: dict[int, str] = {}
         self._pid_command_line_cache: dict[int, str] = {}
+        self._mumu_command_lines_prefetched = False
 
     def find_window(self) -> bool:
         """在可见顶层窗口中查找标题包含指定关键词的目标窗口。"""
@@ -150,8 +151,58 @@ class WindowManager:
         except Exception:
             pass
 
-        windows.sort(key=lambda item: (item["title"].lower(), item["hwnd"]))
+        windows = self._dedupe_matching_windows(windows)
+        windows.sort(key=self._window_sort_key)
         return windows
+
+    @staticmethod
+    def _normalize_window_title(title: str) -> str:
+        """Normalize window titles before sorting and deduping."""
+        return re.sub(r"\s+", " ", (title or "").strip()).lower()
+
+    def _window_sort_key(self, item: dict) -> tuple:
+        """Keep GUI ordering stable across refreshes."""
+        instance_index = item.get("instance_index")
+        normalized_title = self._normalize_window_title(str(item.get("title", "")))
+        return (
+            instance_index is None,
+            instance_index if instance_index is not None else 10_000,
+            normalized_title,
+            int(item.get("hwnd", 0) or 0),
+        )
+
+    def _build_window_group_key(self, item: dict) -> tuple:
+        """Build a dedupe key for likely duplicate MuMu top-level windows."""
+        instance_index = item.get("instance_index")
+        if instance_index is not None:
+            return ("instance", instance_index)
+        return ("pid", item.get("pid"))
+
+    @staticmethod
+    def _window_candidate_score(item: dict) -> tuple:
+        """Prefer the candidate that looks most like the main render window."""
+        width = int(item.get("width", 0) or 0)
+        height = int(item.get("height", 0) or 0)
+        area = width * height
+        normalized_title = re.sub(r"\s+", " ", str(item.get("title", "") or "").strip()).lower()
+        return (
+            area > 0,
+            normalized_title != "mumunxdevice",
+            area,
+            width,
+            height,
+            -int(item.get("hwnd", 0) or 0),
+        )
+
+    def _dedupe_matching_windows(self, windows: list[dict]) -> list[dict]:
+        """Collapse duplicated top-level MuMu windows for the same instance."""
+        deduped: dict[tuple, dict] = {}
+        for item in windows:
+            group_key = self._build_window_group_key(item)
+            current = deduped.get(group_key)
+            if current is None or self._window_candidate_score(item) > self._window_candidate_score(current):
+                deduped[group_key] = item
+        return list(deduped.values())
 
     def _matches_window(self, hwnd: int, title: str) -> bool:
         """判断窗口是否属于目标模拟器实例。"""
@@ -219,6 +270,10 @@ class WindowManager:
         if pid in self._pid_command_line_cache:
             return self._pid_command_line_cache[pid]
 
+        self._prefetch_mumu_process_command_lines()
+        if pid in self._pid_command_line_cache:
+            return self._pid_command_line_cache[pid]
+
         command = (
             "Get-CimInstance Win32_Process | "
             f"Where-Object {{ $_.ProcessId -eq {pid} }} | "
@@ -249,6 +304,47 @@ class WindowManager:
         except Exception:
             self._pid_command_line_cache[pid] = ""
             return ""
+
+    def _prefetch_mumu_process_command_lines(self):
+        """预取 MuMuNxDevice 进程的命令行，减少后续逐个调用 PowerShell。"""
+        if self._mumu_command_lines_prefetched:
+            return
+
+        self._mumu_command_lines_prefetched = True
+        command = (
+            "Get-CimInstance Win32_Process | "
+            "Where-Object { $_.Name -eq 'MuMuNxDevice.exe' } | "
+            "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
+        )
+
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", command],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+            )
+            payload = (result.stdout or "").strip()
+            if not payload:
+                return
+
+            parsed = json.loads(payload)
+            if isinstance(parsed, dict):
+                parsed = [parsed]
+
+            for item in parsed:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    process_id = int(item.get("ProcessId"))
+                except Exception:
+                    continue
+                command_line = str(item.get("CommandLine", "") or "")
+                self._pid_command_line_cache[process_id] = command_line
+        except Exception:
+            return
 
     def set_window_preference(self, hwnd: int | None = None, title: str = ""):
         """设置优先绑定的窗口；未指定时回退为按关键词自动匹配。"""

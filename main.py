@@ -1,7 +1,8 @@
-"""阴阳师答题器 - 主程序入口"""
+﻿"""阴阳师答题器 - 主程序入口"""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
 import os
 import re
@@ -12,6 +13,7 @@ import sys
 import time
 import threading
 from collections import OrderedDict, deque
+from enum import Enum, auto
 from pathlib import Path
 
 
@@ -58,6 +60,38 @@ logging.basicConfig(
 logger = logging.getLogger("main")
 
 
+class PendingAnswerState(Enum):
+    """显式描述当前答题状态机所处阶段。"""
+
+    IDLE = auto()
+    WAITING_SELECTION_OR_CONFIRM = auto()
+    WAITING_QUESTION_CHANGE = auto()
+
+
+class QuestionMatchState(Enum):
+    """描述当前题面与参考题面的关系。"""
+
+    SAME = auto()
+    CHANGED = auto()
+    UNKNOWN = auto()
+
+
+@dataclass
+class PendingAnswerContext:
+    """保存当前待完成题目的上下文。"""
+
+    question_hash: str | None = None
+    question_text_key: str | None = None
+    question_text: str | None = None
+    answer_index: int | None = None
+    baseline: np.ndarray | None = None
+    change_started_at: float = 0.0
+    change_streak: int = 0
+    alternative_answer_index: int | None = None
+    alternative_answer_streak: int = 0
+    confirm_retry_requires_refresh: bool = False
+
+
 class QuizBot:
     """答题器主逻辑，编排截图→OCR→匹配→点击的完整流程。"""
 
@@ -85,16 +119,8 @@ class QuizBot:
         self._doubao_pending_hash = None
         self._doubao_stable_frames = 0
         self._doubao_result_cache = OrderedDict()
-        self._awaiting_confirm_question_hash = None
-        self._awaiting_confirm_logged_hash = None
-        self._awaiting_confirm_question_text_key = None
-        self._awaiting_confirm_logged_text_key = None
-        self._pending_answer_question_hash = None
-        self._pending_answer_question_text_key = None
-        self._pending_answer_question_text = None
-        self._pending_answer_index = None
-        self._pending_answer_baseline = None
-        self._pending_answer_confirmed = False
+        self._pending_answer = PendingAnswerContext()
+        self._pending_answer_state = PendingAnswerState.IDLE
         self._pending_answer_last_click_at = 0.0
         self._last_confirm_click_at = 0.0
         self._seen_match_success_log_keys: set[str] = set()
@@ -213,7 +239,7 @@ class QuizBot:
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
             )
         except Exception as e:
-            self.gui.log(f"[调试] 刷新 adb 设备失败: {e}")
+            self._debug_log(f"刷新 adb 设备失败: {e}")
             return []
 
         devices: list[str] = []
@@ -706,93 +732,158 @@ class QuizBot:
         """使用豆包视觉识别的流程（异步非阻塞）。"""
         frame_hash = self._get_doubao_frame_hash(screenshot, calc)
         self._clear_pending_states_if_question_changed(frame_hash, "")
-        result_to_process = None
-        cached_result = None
-        should_start_recognition = False
+        result_to_process, cached_result, should_start_recognition = self._prepare_doubao_tick(frame_hash)
         should_retry_current_frame = False
 
-        with self._recognition_lock:
-            # 检查是否有待处理的识别结果
-            if self._recognition_result is not None:
-                result, result_screenshot, result_calc, result_hash = self._recognition_result
-                self._recognition_result = None
-                result_to_process = (result, result_screenshot, result_calc, result_hash)
-
-            if not frame_hash:
-                pass
-            elif self._is_same_doubao_frame(frame_hash, self._doubao_last_frame_hash):
-                self._doubao_stable_frames += 1
-            else:
-                self._doubao_last_frame_hash = frame_hash
-                self._doubao_stable_frames = 1
-
-            if (
-                frame_hash
-                and self._pending_recognition is None
-                and self._doubao_stable_frames >= getattr(config, "DOUBAO_TRIGGER_STABLE_FRAMES", 2)
-                and not self._is_exact_doubao_frame(frame_hash, self._doubao_last_processed_hash)
-            ):
-                cached_result = self._get_cached_doubao_result(frame_hash)
-                if cached_result is None:
-                    now = time.time()
-                    if (
-                        not self._is_exact_doubao_frame(frame_hash, self._doubao_last_sent_hash)
-                        and self._can_start_doubao_request(now)
-                    ):
-                        should_start_recognition = True
-
         if result_to_process is not None:
-            result, result_screenshot, result_calc, result_hash = result_to_process
-            if frame_hash and result_hash and not self._is_same_doubao_frame(frame_hash, result_hash):
-                self.gui.log("[调试] 丢弃过期识别结果：题面已变化")
-                processed_ok = False
-                should_retry_current_frame = True
-            else:
-                processed_ok = self._process_doubao_result(result, result_screenshot, result_calc)
-            with self._recognition_lock:
-                if processed_ok:
-                    self._doubao_last_processed_hash = result_hash
-                else:
-                    self._doubao_last_sent_hash = None
+            should_retry_current_frame = self._consume_doubao_recognition_result(
+                result_to_process,
+                frame_hash,
+            )
 
         if cached_result is not None:
-            processed_ok = self._process_doubao_result(cached_result, screenshot, calc)
-            with self._recognition_lock:
-                if processed_ok:
-                    self._doubao_last_processed_hash = frame_hash
-                else:
-                    self._doubao_last_sent_hash = None
-
-        if (
-            result_to_process is None
-            and cached_result is None
-            and self._pending_answer_index is not None
-            and self._is_waiting_same_answer(frame_hash, "", self._pending_answer_index)
-        ):
-            if self._is_exact_doubao_frame(frame_hash, self._pending_answer_question_hash):
-                self._advance_answer_state(
-                    self._pending_answer_question_text or "",
-                    frame_hash,
-                    self._pending_answer_question_text_key or "",
-                    self._pending_answer_index,
-                    screenshot,
-                    calc,
-                )
-            else:
-                self._log_pending_answer_debug_once(
-                    "wait_new_answer_after_change",
-                    frame_hash,
-                    self._pending_answer_question_text_key or "",
-                    self._pending_answer_index,
-                    "[调试] 题面已变化但尚未拿到新答案，跳过上一题的确认点击",
-                )
+            self._consume_cached_doubao_result(cached_result, screenshot, calc, frame_hash)
+        else:
+            self._continue_pending_answer_without_new_doubao_result(
+                result_to_process,
+                frame_hash,
+                screenshot,
+                calc,
+            )
 
         if should_retry_current_frame and frame_hash and cached_result is None:
             should_start_recognition = True
 
         if should_start_recognition:
-            start_log = "[调试] 立即重新识别当前题面" if should_retry_current_frame else "[调试] 开始识别当前题面"
+            start_log = "立即重新识别当前题面" if should_retry_current_frame else "开始识别当前题面"
             self._start_doubao_recognition(screenshot, calc, frame_hash, log_message=start_log)
+
+    def _prepare_doubao_tick(
+        self,
+        frame_hash: str,
+    ) -> tuple[tuple | None, dict | None, bool]:
+        """提取可消费识别结果，并判断本帧是否应发起新的豆包请求。"""
+        result_to_process = None
+        cached_result = None
+        should_start_recognition = False
+
+        with self._recognition_lock:
+            result_to_process = self._pop_pending_doubao_result()
+            self._update_doubao_frame_stability(frame_hash)
+            cached_result, should_start_recognition = self._decide_doubao_recognition_request(frame_hash)
+
+        return result_to_process, cached_result, should_start_recognition
+
+    def _pop_pending_doubao_result(self) -> tuple | None:
+        """取出一条待消费的豆包识别结果。"""
+        if self._recognition_result is None:
+            return None
+        result = self._recognition_result
+        self._recognition_result = None
+        return result
+
+    def _update_doubao_frame_stability(self, frame_hash: str):
+        """更新当前题面哈希的稳定帧计数。"""
+        if not frame_hash:
+            return
+        if self._is_same_doubao_frame(frame_hash, self._doubao_last_frame_hash):
+            self._doubao_stable_frames += 1
+            return
+        self._doubao_last_frame_hash = frame_hash
+        self._doubao_stable_frames = 1
+
+    def _decide_doubao_recognition_request(
+        self,
+        frame_hash: str,
+    ) -> tuple[dict | None, bool]:
+        """判断优先走缓存还是发起新的豆包识别。"""
+        if (
+            not frame_hash
+            or self._pending_recognition is not None
+            or self._doubao_stable_frames < getattr(config, "DOUBAO_TRIGGER_STABLE_FRAMES", 2)
+            or self._is_exact_doubao_frame(frame_hash, self._doubao_last_processed_hash)
+        ):
+            return None, False
+
+        cached_result = self._get_cached_doubao_result(frame_hash)
+        if cached_result is not None:
+            return cached_result, False
+
+        now = time.time()
+        should_start_recognition = (
+            not self._is_exact_doubao_frame(frame_hash, self._doubao_last_sent_hash)
+            and self._can_start_doubao_request(now)
+        )
+        return None, should_start_recognition
+
+    def _consume_doubao_recognition_result(
+        self,
+        result_to_process: tuple,
+        current_frame_hash: str,
+    ) -> bool:
+        """消费异步识别结果，返回是否应立即重试当前题面。"""
+        result, result_screenshot, result_calc, result_hash = result_to_process
+        if self._is_stale_doubao_result(current_frame_hash, result_hash):
+            self._debug_log("丢弃过期识别结果：题面已变化")
+            processed_ok = False
+            should_retry_current_frame = True
+        else:
+            processed_ok = self._process_doubao_result(result, result_screenshot, result_calc)
+            should_retry_current_frame = False
+
+        self._record_doubao_processing_outcome(processed_ok, result_hash)
+        return should_retry_current_frame
+
+    def _consume_cached_doubao_result(
+        self,
+        cached_result: dict,
+        screenshot: np.ndarray,
+        calc: RegionCalculator,
+        frame_hash: str,
+    ):
+        """消费当前帧命中的豆包缓存结果。"""
+        processed_ok = self._process_doubao_result(cached_result, screenshot, calc)
+        self._record_doubao_processing_outcome(processed_ok, frame_hash)
+
+    def _continue_pending_answer_without_new_doubao_result(
+        self,
+        result_to_process: tuple | None,
+        frame_hash: str,
+        screenshot: np.ndarray,
+        calc: RegionCalculator,
+    ):
+        """当前帧没有新识别可消费时，继续推进同题 pending 状态。"""
+        if (
+            result_to_process is not None
+            or self._pending_answer.answer_index is None
+            or not self._is_waiting_same_answer(frame_hash, "", self._pending_answer.answer_index)
+        ):
+            return
+
+        self._advance_answer_state(
+            self._pending_answer.question_text or "",
+            frame_hash,
+            self._pending_answer.question_text_key or "",
+            self._pending_answer.answer_index,
+            screenshot,
+            calc,
+        )
+
+    def _is_stale_doubao_result(self, current_frame_hash: str, result_hash: str) -> bool:
+        """判断异步返回的豆包识别结果是否已经落后于当前题面。"""
+        return bool(
+            current_frame_hash
+            and result_hash
+            and not self._is_same_doubao_frame(current_frame_hash, result_hash)
+        )
+
+    def _record_doubao_processing_outcome(self, processed_ok: bool, processed_hash: str):
+        """统一回写豆包结果消费后的状态。"""
+        with self._recognition_lock:
+            if processed_ok:
+                self._doubao_last_processed_hash = processed_hash
+            else:
+                self._doubao_last_sent_hash = None
 
     def _async_recognize(self, cropped, screenshot, calc, frame_hash):
         """后台线程中调用豆包识别。"""
@@ -802,12 +893,12 @@ class QuizBot:
             self._pending_recognition = None
             self._doubao_pending_hash = None
             if result:
-                self.gui.log("[调试] 识别结果已返回")
+                self._debug_log("识别结果已返回")
                 self._recognition_result = (result, screenshot, calc, frame_hash)
                 if result.get("question") and len(result.get("options", [])) >= 4:
                     self._remember_doubao_result(frame_hash, result)
             else:
-                self.gui.log("[调试] 识别失败，本轮未返回有效结果")
+                self._debug_log("识别失败，本轮未返回有效结果")
                 self._doubao_last_sent_hash = None
 
     def _can_start_doubao_request(self, now: float | None = None) -> bool:
@@ -859,65 +950,32 @@ class QuizBot:
         question_text = result.get("question", "")
         options = result.get("options", [])
         frame_hash = self._get_doubao_frame_hash(screenshot, calc)
-        question_text_key = QuestionMatcher._clean_text(question_text)
         if not question_text:
-            self.gui.log("[调试] 题目内容为空")
+            self._debug_log("题目内容为空")
             return False
-        self._clear_pending_states_if_question_changed(frame_hash, question_text_key)
-
-        # 检查选项数量
-        if not options or len(options) < 4:
-            self.gui.log(f"[调试] 选项数量无效：{len(options)}，期望 4 个")
-            return False
-
-        # 重复检测
-        if self._is_duplicate(question_text):
+        question_text_key = self._prepare_question_processing(frame_hash, question_text)
+        if question_text_key is None:
             return True
 
-        self._log_question_and_options_once(question_text, options)
-
-        # 使用题库匹配答案
-        match = self.matcher.find_answer(question_text, config.FUZZY_MATCH_THRESHOLD)
-        if not match:
-            self.unmatched += 1
-            self.total += 1
-            self.gui.log(f"未匹配到答案")
-            self.matcher.log_unmatched(question_text, config.UNMATCHED_LOG_PATH)
-            self._update_stats()
-            return True
-
-        self._log_match_success_once(question_text, f"题库匹配成功 (分数:{match['score']}): 答案={match['answer']}")
-
-        # 在豆包识别的选项中查找答案
-        correct_answer = match["answer"]
-        answer_index = self._select_answer_index(options, correct_answer, question_text)
-
-        if answer_index == -1:
-            self.gui.log("未在识别的选项中找到答案")
-            self.unmatched += 1
-            self.total += 1
-            self._update_stats()
-            return True
-
-        answer_index = self._resolve_pending_answer_index(
-            frame_hash,
-            question_text_key,
-            answer_index,
+        match = self._find_question_match(
+            question_text,
+            log_options=options,
+            success_message="题库匹配成功 (分数:{score}): 答案={answer}",
         )
-
-        if self._is_waiting_same_answer(frame_hash, question_text_key, answer_index):
-            self._advance_answer_state(
-                question_text,
-                frame_hash,
-                question_text_key,
-                answer_index,
-                screenshot,
-                calc,
-            )
+        if not match:
             return True
 
-        # 点击答案
-        self._advance_answer_state(
+        answer_index = self._resolve_doubao_answer_index(
+            question_text,
+            options,
+            screenshot,
+            calc,
+            match,
+        )
+        if answer_index is None:
+            return False
+
+        self._advance_resolved_answer(
             question_text,
             frame_hash,
             question_text_key,
@@ -927,93 +985,32 @@ class QuizBot:
         )
         return True
 
-        return True
-
     def _tick_with_ocr(self, screenshot, calc: RegionCalculator):
         """使用传统 OCR + 题库匹配的流程。"""
         frame_hash = self._get_doubao_frame_hash(screenshot, calc)
         self._clear_pending_states_if_question_changed(frame_hash, "")
 
-        # 4. 识别题目
-        q_region = calc.get_pixel_region(config.QUESTION_REGION)
-        q_image = crop_region(screenshot, *q_region)
-        q_image_processed = preprocess_for_ocr(q_image, config.PREPROCESSING_SCALE_FACTOR)
-        q_conf = getattr(config, "OCR_QUESTION_CONFIDENCE_THRESHOLD", config.OCR_CONFIDENCE_THRESHOLD)
-        question_text = self.ocr_engine.recognize_text(
-            q_image_processed, q_conf
-        )
+        question_text = self._recognize_question_text_with_ocr(screenshot, calc)
         if not question_text or len(question_text.strip()) < 2:
             return  # 可能不在答题界面
-        question_text_key = QuestionMatcher._clean_text(question_text)
-        self._clear_pending_states_if_question_changed(frame_hash, question_text_key)
-
-        # 5. 重复检测
-        if self._is_duplicate(question_text):
+        question_text_key = self._prepare_question_processing(frame_hash, question_text)
+        if question_text_key is None:
             return
 
-        # 6. 匹配题库
-        match = self.matcher.find_answer(question_text, config.FUZZY_MATCH_THRESHOLD)
-        self._log_question_and_options_once(question_text, match.get("options", []) if match else [])
-        if not match:
-            self.unmatched += 1
-            self.total += 1
-            self.gui.log(f"未匹配到答案")
-            self.matcher.log_unmatched(question_text, config.UNMATCHED_LOG_PATH)
-            self._update_stats()
-            self.recent_questions.append(question_text)
-            return
-
-        correct_answer = match["answer"]
-        self._log_match_success_once(question_text, f"匹配成功 (分数:{match['score']:.0f}): 答案={correct_answer}")
-
-        # 7. 确定点击哪个选项（若选项 OCR 不完整/不确定，可重试几次）
-        retry_count = getattr(config, "OPTION_OCR_RETRY_COUNT", 0)
-        retry_delay = getattr(config, "OPTION_OCR_RETRY_DELAY", 0.0)
-
-        # 安全限制：即使配置被改得很大，也避免在单次 tick 内卡住太久
-        retry_count = max(0, min(int(retry_count), 5))
-
-        click_index = None
-        for attempt in range(retry_count + 1):
-            click_index = self._find_answer_option(screenshot, calc, match)
-            if click_index is not None:
-                break
-
-            if attempt < retry_count:
-                self.gui.log("选项识别不完整/不确定，等待后重试...")
-                time.sleep(retry_delay)
-                screenshot = self.window_mgr.capture_window()
-                if screenshot is None:
-                    self.gui.log("截图失败")
-                    self.recent_questions.append(question_text)
-                    return
-
-        if click_index is None:
-            # 选项区域可能被弹窗/动画遮挡，或者 OCR 暂时不稳定。
-            # 此时不要把题目加入 recent_questions，也不要计入 total，
-            # 让下一轮 tick 继续识别同一题直到点成功或题目变化。
-            self.gui.log("未找到对应选项，本轮不点击，等待下轮继续识别...")
-            return
-
-        click_index = self._resolve_pending_answer_index(
-            frame_hash,
-            question_text_key,
-            click_index,
+        match = self._find_question_match(
+            question_text,
+            success_message="匹配成功 (分数:{score:.0f}): 答案={answer}",
+            remember_recent_unmatched=True,
         )
-
-        if self._is_waiting_same_answer(frame_hash, question_text_key, click_index):
-            self._advance_answer_state(
-                question_text,
-                frame_hash,
-                question_text_key,
-                click_index,
-                screenshot,
-                calc,
-            )
+        if not match:
             return
 
-        # 8. 点击
-        self._advance_answer_state(
+        resolved = self._resolve_ocr_answer_index(question_text, screenshot, calc, match)
+        if resolved is None:
+            return
+        click_index, screenshot = resolved
+
+        self._advance_resolved_answer(
             question_text,
             frame_hash,
             question_text_key,
@@ -1035,92 +1032,131 @@ class QuizBot:
     ):
         """同一题只推进两件事：选中目标答案，点击固定确认按钮。"""
         if not getattr(config, "ENABLE_SECOND_STAGE_CONFIRM", True):
-            click_x, click_y = calc.get_click_point(config.ANSWER_REGIONS[answer_index])
-            self._log_answer_click(answer_index)
-            self.clicker.click_at(click_x, click_y, self.window_mgr.hwnd)
-            self.total += 1
-            self.matched += 1
-            self.recent_questions.append(question_text)
-            self._update_stats()
+            self._click_answer_without_second_stage(question_text, answer_index, calc)
             return
 
         if self._is_waiting_same_answer(frame_hash, question_text_key, answer_index):
-            answer_selected = self._is_pending_answer_selected(screenshot, answer_index, calc)
-            confirm_present = self._is_fixed_confirm_button_present(
-                self._pending_answer_baseline,
-                screenshot,
-                answer_index,
-                calc,
-            )
+            self._process_existing_pending_answer(frame_hash, question_text_key, answer_index, screenshot, calc)
+            return
 
-            if confirm_present:
-                if self._can_issue_confirm_click():
-                    confirm_x, confirm_y = self._get_fixed_confirm_click_point(answer_index, calc)
-                    self.gui.log(f"[调试] 检测到固定确认按钮：{chr(65 + answer_index)}")
-                    self.clicker.click_at(
-                        confirm_x,
-                        confirm_y,
-                        self.window_mgr.hwnd,
-                        delay_override=max(
-                            0.0,
-                            float(
-                                getattr(
-                                    config,
-                                    "SECOND_STAGE_CONFIRM_CLICK_DELAY",
-                                    getattr(config, "CLICK_DELAY", 0.3),
-                                )
-                            ),
-                        ),
-                    )
-                    self._pending_answer_confirmed = True
-                    now = time.time()
-                    self._pending_answer_last_click_at = now
-                    self._last_confirm_click_at = now
-                    self.gui.log(f"[调试] 已点击固定确认按钮：{chr(65 + answer_index)}")
-                else:
-                    self._log_pending_answer_debug_once(
-                        "confirm_throttled",
-                        frame_hash,
-                        question_text_key,
-                        answer_index,
-                        f"[调试] 已检测到固定确认按钮，但确认点击冷却未到：{chr(65 + answer_index)}",
-                    )
-                return
+        self._transition_pending_answer_state(
+            PendingAnswerState.WAITING_SELECTION_OR_CONFIRM,
+            question_text=question_text,
+            frame_hash=frame_hash,
+            question_text_key=question_text_key,
+            answer_index=answer_index,
+            screenshot=screenshot,
+        )
+        self._click_pending_answer_option(answer_index, calc)
 
-            if not answer_selected:
-                self._log_pending_answer_debug_once(
-                    "wait_selection",
-                    frame_hash,
-                    question_text_key,
-                    answer_index,
-                    f"[调试] 选项 {chr(65 + answer_index)} 尚未判定为已选中，且固定确认按钮未命中",
-                )
-                if self._can_issue_pending_click():
-                    click_x, click_y = calc.get_click_point(config.ANSWER_REGIONS[answer_index])
-                    self._log_answer_click(answer_index)
-                    self.clicker.click_at(click_x, click_y, self.window_mgr.hwnd)
-                    self._pending_answer_last_click_at = time.time()
-                return
+    def _process_existing_pending_answer(
+        self,
+        frame_hash: str,
+        question_text_key: str,
+        answer_index: int,
+        screenshot: np.ndarray,
+        calc: RegionCalculator,
+    ):
+        """处理已存在的 pending 题目。"""
+        if self._pending_answer_state == PendingAnswerState.WAITING_QUESTION_CHANGE:
+            self._process_waiting_question_change(frame_hash, question_text_key, answer_index, screenshot, calc)
+            return
+        self._process_waiting_selection_or_confirm(frame_hash, question_text_key, answer_index, screenshot, calc)
 
+    def _process_waiting_question_change(
+        self,
+        frame_hash: str,
+        question_text_key: str,
+        answer_index: int,
+        screenshot: np.ndarray,
+        calc: RegionCalculator,
+    ):
+        """确认已点击后，只等待题目切换或再次确认按钮出现。"""
+        if self._handle_pending_confirm_button(frame_hash, question_text_key, answer_index, screenshot, calc):
+            return
+
+        self._log_pending_answer_debug_once(
+            "wait_question_change",
+            frame_hash,
+            question_text_key,
+            answer_index,
+            f"已点击确认，等待题目切换，暂不重复点击选项 {self._answer_label(answer_index)}",
+        )
+
+    def _process_waiting_selection_or_confirm(
+        self,
+        frame_hash: str,
+        question_text_key: str,
+        answer_index: int,
+        screenshot: np.ndarray,
+        calc: RegionCalculator,
+    ):
+        """等待选项选中，或等待固定确认按钮出现。"""
+        answer_selected = self._is_pending_answer_selected(screenshot, answer_index, calc)
+        if self._handle_pending_confirm_button(frame_hash, question_text_key, answer_index, screenshot, calc):
+            self._reset_pending_alternative_answer()
+            return
+
+        if not answer_selected:
             self._log_pending_answer_debug_once(
-                "wait_confirm",
+                "wait_selection",
                 frame_hash,
                 question_text_key,
                 answer_index,
-                f"[调试] 选项 {chr(65 + answer_index)} 已判定为选中，但固定确认按钮未命中",
+                f"选项 {self._answer_label(answer_index)} 尚未判定为已选中，且固定确认按钮未命中",
             )
+            if self._can_issue_pending_click():
+                self._click_pending_answer_option(answer_index, calc)
             return
 
-        click_x, click_y = calc.get_click_point(config.ANSWER_REGIONS[answer_index])
-        self._pending_answer_question_hash = frame_hash or None
-        self._pending_answer_question_text_key = question_text_key or None
-        self._pending_answer_question_text = question_text
-        self._pending_answer_index = answer_index
-        self._pending_answer_baseline = screenshot
-        self._pending_answer_confirmed = False
-        self._pending_answer_last_click_at = time.time()
-        self._log_answer_click(answer_index)
-        self.clicker.click_at(click_x, click_y, self.window_mgr.hwnd)
+        self._reset_pending_alternative_answer()
+        self._log_pending_answer_debug_once(
+            "wait_confirm",
+            frame_hash,
+            question_text_key,
+            answer_index,
+            f"选项 {self._answer_label(answer_index)} 已判定为选中，但固定确认按钮未命中",
+        )
+
+    def _handle_pending_confirm_button(
+        self,
+        frame_hash: str,
+        question_text_key: str,
+        answer_index: int,
+        screenshot: np.ndarray,
+        calc: RegionCalculator,
+    ) -> bool:
+        """统一处理固定确认按钮检测、节流和点击。"""
+        confirm_present = self._is_fixed_confirm_button_present(
+            self._pending_answer.baseline,
+            screenshot,
+            answer_index,
+            calc,
+        )
+        if not confirm_present:
+            return False
+
+        if self._pending_answer.confirm_retry_requires_refresh:
+            self._log_pending_answer_debug_once(
+                "confirm_wait_refresh",
+                frame_hash,
+                question_text_key,
+                answer_index,
+                f"已检测到固定确认按钮，但等待同题重新识别确认后才允许再次点击：{self._answer_label(answer_index)}",
+            )
+            return True
+
+        if self._can_issue_confirm_click():
+            self._click_pending_confirm_button(answer_index, calc)
+        else:
+            self._log_pending_answer_debug_once(
+                "confirm_throttled",
+                frame_hash,
+                question_text_key,
+                answer_index,
+                f"已检测到固定确认按钮，但确认点击冷却未到：{self._answer_label(answer_index)}",
+            )
+        return True
 
     def _can_issue_pending_click(self) -> bool:
         min_interval = max(
@@ -1136,16 +1172,158 @@ class QuizBot:
         )
         return (time.time() - self._last_confirm_click_at) >= min_interval
 
+    def _set_pending_answer_state(self, state: PendingAnswerState):
+        """更新当前答题状态机阶段。"""
+        previous_state = self._pending_answer_state
+        self._pending_answer_state = state
+        pending_label = self._format_pending_answer_label()
+        if state == PendingAnswerState.WAITING_QUESTION_CHANGE:
+            self._pending_answer.change_started_at = time.time()
+            self._pending_answer.change_streak = 0
+        else:
+            self._pending_answer.change_started_at = 0.0
+            self._pending_answer.change_streak = 0
+        if previous_state != state:
+            self._seen_pending_answer_debug_keys.clear()
+            self._debug_log(f"状态切换: {previous_state.name} -> {state.name}{pending_label}")
+
+    def _format_pending_answer_label(self) -> str:
+        """为状态切换日志生成简短题目上下文。"""
+        answer_index = self._pending_answer.answer_index
+        suffix = ""
+        if answer_index is not None:
+            suffix += f" | 选项={self._answer_label(answer_index)}"
+        question_text = (self._pending_answer.question_text or "").strip()
+        if question_text:
+            suffix += f" | 题目={question_text[:24]}"
+        return suffix
+
+    def _reset_pending_alternative_answer(self):
+        """清理待切换的新候选答案跟踪。"""
+        self._pending_answer.alternative_answer_index = None
+        self._pending_answer.alternative_answer_streak = 0
+
+    def _set_pending_answer_context(
+        self,
+        question_text: str,
+        frame_hash: str,
+        question_text_key: str,
+        answer_index: int,
+        screenshot: np.ndarray,
+    ):
+        """写入当前待确认题目的上下文。"""
+        self._pending_answer.question_hash = frame_hash or None
+        self._pending_answer.question_text_key = question_text_key or None
+        self._pending_answer.question_text = question_text
+        self._pending_answer.answer_index = answer_index
+        self._pending_answer.baseline = screenshot
+        self._pending_answer.confirm_retry_requires_refresh = False
+        self._reset_pending_alternative_answer()
+
+    def _transition_pending_answer_state(
+        self,
+        state: PendingAnswerState,
+        *,
+        question_text: str | None = None,
+        frame_hash: str = "",
+        question_text_key: str = "",
+        answer_index: int | None = None,
+        screenshot: np.ndarray | None = None,
+    ):
+        """统一更新 pending 上下文与状态。"""
+        if (
+            question_text is not None
+            and answer_index is not None
+            and screenshot is not None
+        ):
+            self._set_pending_answer_context(
+                question_text,
+                frame_hash,
+                question_text_key,
+                answer_index,
+                screenshot,
+            )
+        self._set_pending_answer_state(state)
+
+    def _click_pending_answer_option(self, answer_index: int, calc: RegionCalculator):
+        """点击当前待确认选项，并刷新点击时间。"""
+        click_x, click_y = calc.get_click_point(config.ANSWER_REGIONS[answer_index])
+        self._log_answer_click(answer_index)
+        self.clicker.click_at(click_x, click_y, self.window_mgr.hwnd)
+        self._pending_answer_last_click_at = time.time()
+
+    def _click_pending_confirm_button(self, answer_index: int, calc: RegionCalculator):
+        """点击固定确认按钮，并切换到等待翻题状态。"""
+        confirm_x, confirm_y = self._get_fixed_confirm_click_point(answer_index, calc)
+        self._reset_pending_alternative_answer()
+        self._debug_log(f"检测到固定确认按钮：{self._answer_label(answer_index)}")
+        self.clicker.click_at(
+            confirm_x,
+            confirm_y,
+            self.window_mgr.hwnd,
+            delay_override=max(
+                0.0,
+                float(
+                    getattr(
+                        config,
+                        "SECOND_STAGE_CONFIRM_CLICK_DELAY",
+                        getattr(config, "CLICK_DELAY", 0.3),
+                    )
+                ),
+            ),
+        )
+        self._transition_pending_answer_state(PendingAnswerState.WAITING_QUESTION_CHANGE)
+        now = time.time()
+        self._pending_answer_last_click_at = now
+        self._last_confirm_click_at = now
+        self._debug_log(f"已点击固定确认按钮：{self._answer_label(answer_index)}")
+
+    def _get_question_match_state(
+        self,
+        current_hash: str,
+        current_text_key: str,
+        reference_hash: str | None,
+        reference_text_key: str | None,
+        require_exact_hash_same: bool = False,
+    ) -> QuestionMatchState:
+        """通过题目文本和题面哈希双通道判断是否为同一题。"""
+        current_hash = current_hash or ""
+        current_text_key = current_text_key or ""
+        reference_hash = reference_hash or ""
+        reference_text_key = reference_text_key or ""
+
+        text_comparable = bool(current_text_key and reference_text_key)
+        hash_comparable = bool(current_hash and reference_hash)
+        text_same = text_comparable and current_text_key == reference_text_key
+        fuzzy_hash_same = hash_comparable and self._is_same_doubao_frame(current_hash, reference_hash)
+        exact_hash_same = hash_comparable and self._is_exact_doubao_frame(current_hash, reference_hash)
+        hash_same = exact_hash_same if require_exact_hash_same else fuzzy_hash_same
+
+        if text_same or hash_same:
+            return QuestionMatchState.SAME
+
+        text_changed = text_comparable and current_text_key != reference_text_key
+        hash_changed = hash_comparable and not fuzzy_hash_same
+
+        if text_changed and hash_changed:
+            return QuestionMatchState.CHANGED
+        if text_changed and not hash_comparable:
+            return QuestionMatchState.CHANGED
+        if hash_changed and not text_comparable:
+            return QuestionMatchState.CHANGED
+
+        return QuestionMatchState.UNKNOWN
+
     def _is_pending_answer_selected(
         self,
         current: np.ndarray,
         answer_index: int,
         calc: RegionCalculator,
     ) -> bool:
-        if self._pending_answer_baseline is None:
+        if self._pending_answer.baseline is None:
             return self._looks_answer_option_selected(current, answer_index, calc)
         if self._did_answer_region_change(
-            self._pending_answer_baseline,
+            self._pending_answer.baseline,
             current,
             answer_index,
             calc,
@@ -1154,256 +1332,415 @@ class QuizBot:
         return self._looks_answer_option_selected(current, answer_index, calc)
 
     def _finalize_pending_answer(self):
-        if not self._pending_answer_confirmed:
+        if self._pending_answer_state != PendingAnswerState.WAITING_QUESTION_CHANGE:
             return
         self.total += 1
         self.matched += 1
-        if self._pending_answer_question_text:
-            self.recent_questions.append(self._pending_answer_question_text)
+        if self._pending_answer.question_text:
+            self.recent_questions.append(self._pending_answer.question_text)
         self._update_stats()
-
-    def _handle_post_answer_click(
-        self,
-        question_text: str,
-        answer_index: int,
-        screenshot_before_click: np.ndarray,
-        calc: RegionCalculator,
-    ) -> bool:
-        """选中答案后，等待下一题出现或执行二阶段确认点击。"""
-        if not getattr(config, "ENABLE_SECOND_STAGE_CONFIRM", True):
-            time.sleep(config.POST_CLICK_DELAY)
-            return True
-
-        question_hash = self._get_doubao_frame_hash(screenshot_before_click, calc)
-        timeout_s = max(0.2, float(getattr(config, "SECOND_STAGE_CONFIRM_TIMEOUT", 1.6)))
-        poll_interval = max(0.05, float(getattr(config, "SECOND_STAGE_CONFIRM_POLL_INTERVAL", 0.12)))
-        after_click_timeout_s = max(
-            0.05,
-            float(getattr(config, "SECOND_STAGE_CONFIRM_AFTER_CLICK_TIMEOUT", timeout_s)),
-        )
-        confirm_click_delay = max(
-            0.0,
-            float(getattr(config, "SECOND_STAGE_CONFIRM_CLICK_DELAY", getattr(config, "CLICK_DELAY", 0.3))),
-        )
-        confirm_trigger_delay = max(
-            0.05,
-            float(getattr(config, "SECOND_STAGE_CONFIRM_TRIGGER_DELAY", 0.12)),
-        )
-        retry_count = max(0, int(getattr(config, "SECOND_STAGE_SELECTION_RETRY_COUNT", 1)))
-        min_present_frames = max(1, int(getattr(config, "SECOND_STAGE_CONFIRM_MIN_PRESENT_FRAMES", 2)))
-        saw_selection_change = False
-
-        for attempt in range(retry_count + 1):
-            attempt_started_at = time.time()
-            confirm_probe_enabled = False
-            if attempt > 0:
-                current_before_retry = self.window_mgr.capture_window()
-                if current_before_retry is not None and self._did_answer_region_change(
-                    screenshot_before_click,
-                    current_before_retry,
-                    answer_index,
-                    calc,
-                ):
-                    self.gui.log(f"[调试] 当前已停留在选项 {chr(65 + answer_index)}，跳过重复点击")
-                else:
-                    self.gui.log(f"[调试] 重试点击选项 {chr(65 + answer_index)}")
-                    retry_x, retry_y = calc.get_click_point(config.ANSWER_REGIONS[answer_index])
-                    self.clicker.click_at(retry_x, retry_y, self.window_mgr.hwnd)
-
-            selection_change_time = None
-            confirm_present_frames = 0
-            confirm_point = None
-            confirm_source = None
-            deadline = time.time() + timeout_s
-            while time.time() < deadline:
-                time.sleep(poll_interval)
-                current = self.window_mgr.capture_window()
-                if current is None:
-                    continue
-
-                current_hash = self._get_doubao_frame_hash(current, calc)
-                if current_hash and question_hash and not self._is_same_doubao_frame(question_hash, current_hash):
-                    return True
-
-                answer_region_changed = self._did_answer_region_change(
-                    screenshot_before_click,
-                    current,
-                    answer_index,
-                    calc,
-                )
-
-                if answer_region_changed and not saw_selection_change:
-                    self.gui.log(f"[调试] 已选中选项 {chr(65 + answer_index)}，等待题目切换或固定确认点击")
-                    saw_selection_change = True
-                    selection_change_time = time.time()
-
-                if answer_region_changed:
-                    confirm_probe_enabled = True
-                elif not confirm_probe_enabled and time.time() - attempt_started_at >= confirm_trigger_delay:
-                    self.gui.log(f"[调试] 选项 {chr(65 + answer_index)} 未出现明显变化，继续探测题目切换或固定确认按钮")
-                    confirm_probe_enabled = True
-                    if selection_change_time is None:
-                        selection_change_time = attempt_started_at
-
-                if not confirm_probe_enabled:
-                    continue
-
-                if selection_change_time is None:
-                    selection_change_time = time.time()
-                if time.time() - selection_change_time < confirm_trigger_delay:
-                    continue
-
-                if self._is_fixed_confirm_button_present(
-                    screenshot_before_click,
-                    current,
-                    answer_index,
-                    calc,
-                ):
-                    confirm_present_frames += 1
-                else:
-                    confirm_present_frames = 0
-                    continue
-
-                if confirm_present_frames < min_present_frames:
-                    continue
-
-                confirm_point = self._get_fixed_confirm_click_point(answer_index, calc)
-                self.gui.log(f"[调试] 检测到二阶段确认按钮并执行点击：{chr(65 + answer_index)}")
-                self._awaiting_confirm_question_hash = question_hash or None
-                self._awaiting_confirm_logged_hash = None
-                self._awaiting_confirm_question_text_key = QuestionMatcher._clean_text(question_text)
-                self._awaiting_confirm_logged_text_key = None
-                self.clicker.click_at(
-                    confirm_point[0],
-                    confirm_point[1],
-                    self.window_mgr.hwnd,
-                    delay_override=confirm_click_delay,
-                )
-                if self._wait_for_question_change(question_hash, calc, after_click_timeout_s):
-                    self._awaiting_confirm_question_hash = None
-                    self._awaiting_confirm_logged_hash = None
-                    self._awaiting_confirm_question_text_key = None
-                    self._awaiting_confirm_logged_text_key = None
-                    return True
-                return False
-
-        self.gui.log(f"[调试] 固定确认区域未命中：{chr(65 + answer_index)}")
-        return False
-
-    def _should_wait_for_confirmed_question(self, frame_hash: str) -> bool:
-        """如果上一题已点击确认但尚未翻题，则阻止再次处理同一题。"""
-        pending_hash = self._awaiting_confirm_question_hash
-        if not pending_hash:
-            return False
-
-        if frame_hash and not self._is_same_doubao_frame(frame_hash, pending_hash):
-            self._awaiting_confirm_question_hash = None
-            self._awaiting_confirm_logged_hash = None
-            self._clear_pending_answer()
-            return False
-
-        if self._awaiting_confirm_logged_hash != pending_hash:
-            self.gui.log("[调试] 已点击确认，等待题目切换后再处理下一次确认")
-            self._awaiting_confirm_logged_hash = pending_hash
-        return True
-
-    def _should_wait_for_confirmed_question_text(self, question_text_key: str) -> bool:
-        """如果同一题已经点击过确认，则在题目文本变化前不再重复处理。"""
-        pending_text_key = self._awaiting_confirm_question_text_key
-        if not pending_text_key or not question_text_key:
-            return False
-        if question_text_key != pending_text_key:
-            self._awaiting_confirm_question_text_key = None
-            self._awaiting_confirm_logged_text_key = None
-            return False
-        if self._awaiting_confirm_logged_text_key != pending_text_key:
-            self.gui.log("[调试] 已点击确认，等待题目切换后再处理下一次确认")
-            self._awaiting_confirm_logged_text_key = pending_text_key
-        return True
 
     def _is_waiting_same_answer(self, frame_hash: str, question_text_key: str, answer_index: int) -> bool:
         """判断当前题面是否仍在等待同一题、同一答案的后续确认。"""
         if (
-            (not self._pending_answer_question_hash and not self._pending_answer_question_text_key)
-            or self._pending_answer_index is None
-            or self._pending_answer_baseline is None
+            self._pending_answer_state == PendingAnswerState.IDLE
+            or (not self._pending_answer.question_hash and not self._pending_answer.question_text_key)
+            or self._pending_answer.answer_index is None
+            or self._pending_answer.baseline is None
         ):
             return False
-        if answer_index != self._pending_answer_index:
+        if answer_index != self._pending_answer.answer_index:
             return False
-        if question_text_key and self._pending_answer_question_text_key:
-            if question_text_key == self._pending_answer_question_text_key:
-                return True
-        if not frame_hash or not self._pending_answer_question_hash:
-            return False
-        return self._is_same_doubao_frame(frame_hash, self._pending_answer_question_hash)
+        match_state = self._get_pending_question_match_state(frame_hash, question_text_key)
+        return match_state == QuestionMatchState.SAME
 
-    def _resolve_pending_answer_index(self, frame_hash: str, question_text_key: str, answer_index: int) -> int:
-        """同题重识别若得到不同答案，保持当前待确认选项，避免中途切换点击目标。"""
-        pending_index = self._pending_answer_index
-        if pending_index is None or pending_index == answer_index or self._pending_answer_baseline is None:
+    def _resolve_pending_answer_index(
+        self,
+        frame_hash: str,
+        question_text_key: str,
+        answer_index: int,
+        screenshot: np.ndarray,
+        calc: RegionCalculator,
+    ) -> int:
+        """同题重识别默认保持当前待确认选项，但允许在明确失配时切换。"""
+        pending_index = self._pending_answer.answer_index
+        if pending_index is None or pending_index == answer_index or self._pending_answer.baseline is None:
+            if pending_index == answer_index:
+                self._reset_pending_alternative_answer()
             return answer_index
 
-        same_question = False
-        pending_text_key = self._pending_answer_question_text_key
-        if question_text_key and pending_text_key:
-            same_question = question_text_key == pending_text_key
-        elif frame_hash and self._pending_answer_question_hash:
-            same_question = self._is_same_doubao_frame(frame_hash, self._pending_answer_question_hash)
-
-        if not same_question:
+        pending_text_key = self._pending_answer.question_text_key
+        match_state = self._get_pending_question_match_state(frame_hash, question_text_key)
+        if match_state != QuestionMatchState.SAME:
+            self._reset_pending_alternative_answer()
             return answer_index
 
-        self._log_pending_answer_debug_once(
-            "keep_pending_answer",
+        return self._resolve_same_question_pending_answer_index(
             frame_hash,
-            question_text_key or pending_text_key or "",
-            pending_index,
-            f"[调试] 同题重识别得到不同选项，保持原待确认选项 {chr(65 + pending_index)}，忽略新候选 {chr(65 + answer_index)}",
+            question_text_key,
+            answer_index,
+            screenshot,
+            calc,
+            pending_text_key,
         )
-        return pending_index
+
+    def _resolve_same_question_pending_answer_index(
+        self,
+        frame_hash: str,
+        question_text_key: str,
+        answer_index: int,
+        screenshot: np.ndarray,
+        calc: RegionCalculator,
+        pending_text_key: str,
+    ) -> int:
+        """同题前提下，决定继续保持旧答案还是切到新候选。"""
+        pending_index = self._pending_answer.answer_index
+        if pending_index is None:
+            self._reset_pending_alternative_answer()
+            return answer_index
+
+        if self._pending_answer_state != PendingAnswerState.WAITING_SELECTION_OR_CONFIRM:
+            self._reset_pending_alternative_answer()
+            self._log_pending_answer_debug_once(
+                "keep_pending_answer",
+                frame_hash,
+                question_text_key or pending_text_key or "",
+                pending_index,
+                f"同题重识别得到不同选项，保持原待确认选项 {self._answer_label(pending_index)}，忽略新候选 {self._answer_label(answer_index)}",
+            )
+            return pending_index
+
+        return self._maybe_switch_pending_answer_candidate(
+            frame_hash,
+            question_text_key,
+            answer_index,
+            screenshot,
+            calc,
+            pending_index,
+            pending_text_key,
+        )
+
+    def _maybe_switch_pending_answer_candidate(
+        self,
+        frame_hash: str,
+        question_text_key: str,
+        answer_index: int,
+        screenshot: np.ndarray,
+        calc: RegionCalculator,
+        pending_index: int,
+        pending_text_key: str,
+    ) -> int:
+        """同题同阶段下，判断是否允许从旧候选切到新候选。"""
+        if self._is_pending_answer_selected(screenshot, pending_index, calc):
+            self._reset_pending_alternative_answer()
+            self._log_pending_answer_debug_once(
+                "keep_pending_answer_selected",
+                frame_hash,
+                question_text_key or pending_text_key or "",
+                pending_index,
+                f"原待确认选项 {self._answer_label(pending_index)} 已判定为选中，忽略新候选 {self._answer_label(answer_index)}",
+            )
+            return pending_index
+
+        min_age = max(0.2, float(getattr(config, "SECOND_STAGE_PENDING_SWITCH_MIN_AGE", 0.8)))
+        pending_age = time.time() - self._pending_answer_last_click_at
+        if pending_age < min_age:
+            if self._pending_answer.alternative_answer_index != answer_index:
+                self._pending_answer.alternative_answer_index = answer_index
+                self._pending_answer.alternative_answer_streak = 1
+            self._log_pending_answer_debug_once(
+                "keep_pending_answer_recent_click",
+                frame_hash,
+                question_text_key or pending_text_key or "",
+                pending_index,
+                f"原待确认选项 {self._answer_label(pending_index)} 刚点击不久，暂不切换到 {self._answer_label(answer_index)}",
+            )
+            return pending_index
+
+        if self._pending_answer.alternative_answer_index != answer_index:
+            self._pending_answer.alternative_answer_index = answer_index
+            self._pending_answer.alternative_answer_streak = 1
+        else:
+            self._pending_answer.alternative_answer_streak += 1
+
+        min_streak = max(1, int(getattr(config, "SECOND_STAGE_PENDING_SWITCH_MIN_STREAK", 2)))
+        if self._pending_answer.alternative_answer_streak < min_streak:
+            self._log_pending_answer_debug_once(
+                "keep_pending_answer_wait_switch",
+                frame_hash,
+                question_text_key or pending_text_key or "",
+                pending_index,
+                f"新候选 {self._answer_label(answer_index)} 已连续出现 {self._pending_answer.alternative_answer_streak} 次，继续观察后再决定是否从 {self._answer_label(pending_index)} 切换",
+            )
+            return pending_index
+
+        self._debug_log(
+            f"原待确认选项 {self._answer_label(pending_index)} 长时间未选中，切换到连续候选 {self._answer_label(answer_index)}"
+        )
+        self._reset_pending_alternative_answer()
+        self._seen_pending_answer_debug_keys.clear()
+        return answer_index
+
+    def _get_pending_question_match_state(self, frame_hash: str, question_text_key: str) -> QuestionMatchState:
+        """判断当前题面与 pending 题面之间的关系。"""
+        return self._get_question_match_state(
+            frame_hash,
+            question_text_key,
+            self._pending_answer.question_hash,
+            self._pending_answer.question_text_key,
+            require_exact_hash_same=self._pending_answer_state == PendingAnswerState.WAITING_QUESTION_CHANGE,
+        )
 
     def _clear_pending_states_if_question_changed(self, frame_hash: str, question_text_key: str):
         """题面或题目文本变化后，清理上一题残留状态。"""
-        pending_text_key = self._pending_answer_question_text_key
-        should_clear_pending = False
-        question_changed = False
-        if pending_text_key and question_text_key and question_text_key != pending_text_key:
-            should_clear_pending = True
-            question_changed = True
-        elif self._pending_answer_question_hash and frame_hash and not self._is_same_doubao_frame(frame_hash, self._pending_answer_question_hash):
-            should_clear_pending = True
-            question_changed = True
+        pending_relation = self._get_pending_question_change_relation(frame_hash, question_text_key)
+        should_clear_pending, question_changed = self._evaluate_pending_question_change(pending_relation)
 
         if should_clear_pending:
-            self._finalize_pending_answer()
-            self._clear_pending_answer()
-
-        confirm_text_key = self._awaiting_confirm_question_text_key
-        if confirm_text_key and question_text_key and question_text_key != confirm_text_key:
-            self._awaiting_confirm_question_text_key = None
-            self._awaiting_confirm_logged_text_key = None
-            question_changed = True
-        elif self._awaiting_confirm_question_hash and frame_hash and not self._is_same_doubao_frame(frame_hash, self._awaiting_confirm_question_hash):
-            self._awaiting_confirm_question_hash = None
-            self._awaiting_confirm_logged_hash = None
-            self._awaiting_confirm_question_text_key = None
-            self._awaiting_confirm_logged_text_key = None
-            question_changed = True
+            self._finalize_and_clear_pending_answer()
 
         if question_changed:
             self._last_confirm_click_at = 0.0
 
+    def _get_pending_question_change_relation(
+        self,
+        frame_hash: str,
+        question_text_key: str,
+    ) -> QuestionMatchState:
+        """用宽松同题规则判断当前题面和 pending 题面的变化关系。"""
+        return self._get_question_match_state(
+            frame_hash,
+            question_text_key,
+            self._pending_answer.question_hash,
+            self._pending_answer.question_text_key,
+        )
+
+    def _evaluate_pending_question_change(
+        self,
+        pending_relation: QuestionMatchState,
+    ) -> tuple[bool, bool]:
+        """根据当前状态评估是否应结算并清理 pending 题目。"""
+        if self._pending_answer_state == PendingAnswerState.WAITING_QUESTION_CHANGE:
+            return self._evaluate_waiting_question_change(pending_relation)
+        if pending_relation == QuestionMatchState.CHANGED:
+            return True, True
+        return False, False
+
+    def _evaluate_waiting_question_change(
+        self,
+        pending_relation: QuestionMatchState,
+    ) -> tuple[bool, bool]:
+        """处理已点击确认后的翻题检测与回退逻辑。"""
+        if pending_relation == QuestionMatchState.CHANGED:
+            self._pending_answer.change_streak += 1
+            min_frames = max(1, int(getattr(config, "SECOND_STAGE_QUESTION_CHANGE_MIN_FRAMES", 2)))
+            if self._pending_answer.change_streak >= min_frames:
+                return True, True
+            return False, False
+
+        self._pending_answer.change_streak = 0
+        self._rollback_waiting_question_change_if_timed_out()
+        return False, False
+
+    def _rollback_waiting_question_change_if_timed_out(self):
+        """等待翻题超时后，恢复到继续检查选中态和确认按钮。"""
+        timeout_s = max(
+            0.5,
+            float(getattr(config, "SECOND_STAGE_QUESTION_CHANGE_TIMEOUT", 1.5)),
+        )
+        if (
+            self._pending_answer.change_started_at <= 0
+            or (time.time() - self._pending_answer.change_started_at) < timeout_s
+        ):
+            return
+
+        answer_index = self._pending_answer.answer_index
+        if answer_index is not None:
+            self._debug_log(
+                f"等待题目切换超时，恢复为继续检查选项 {self._answer_label(answer_index)} 和确认按钮"
+            )
+        self._pending_answer.confirm_retry_requires_refresh = True
+        self._set_pending_answer_state(PendingAnswerState.WAITING_SELECTION_OR_CONFIRM)
+
+    def _finalize_and_clear_pending_answer(self):
+        """结算当前 pending 题目并清理上下文。"""
+        self._finalize_pending_answer()
+        self._clear_pending_answer()
+
     def _clear_pending_answer(self):
         """清理等待确认中的答案点击状态。"""
-        self._pending_answer_question_hash = None
-        self._pending_answer_question_text_key = None
-        self._pending_answer_question_text = None
-        self._pending_answer_index = None
-        self._pending_answer_baseline = None
-        self._pending_answer_confirmed = False
+        self._set_pending_answer_state(PendingAnswerState.IDLE)
+        self._pending_answer = PendingAnswerContext()
         self._pending_answer_last_click_at = 0.0
         self._seen_pending_answer_debug_keys.clear()
+
+    def _prepare_question_processing(self, frame_hash: str, question_text: str) -> str | None:
+        """统一处理题面变化清理与重复题过滤。"""
+        question_text_key = QuestionMatcher._clean_text(question_text)
+        self._clear_pending_states_if_question_changed(frame_hash, question_text_key)
+        self._mark_pending_question_refreshed(frame_hash, question_text_key)
+        if self._is_duplicate(question_text):
+            return None
+        return question_text_key
+
+    def _mark_pending_question_refreshed(self, frame_hash: str, question_text_key: str):
+        """同题重新识别成功后，允许超时回退后的确认重试。"""
+        if (
+            self._pending_answer_state != PendingAnswerState.WAITING_SELECTION_OR_CONFIRM
+            or not self._pending_answer.confirm_retry_requires_refresh
+        ):
+            return
+
+        if self._get_pending_question_match_state(frame_hash, question_text_key) != QuestionMatchState.SAME:
+            return
+
+        self._pending_answer.confirm_retry_requires_refresh = False
+        answer_index = self._pending_answer.answer_index
+        if answer_index is not None:
+            self._debug_log(
+                f"同题重新识别已确认，允许再次点击固定确认按钮：{self._answer_label(answer_index)}"
+            )
+
+    def _handle_unmatched_question(self, question_text: str, *, remember_recent: bool = False):
+        """统一处理题库未命中的统计与日志。"""
+        self.unmatched += 1
+        self.total += 1
+        self.gui.log("未匹配到答案")
+        self.matcher.log_unmatched(question_text, config.UNMATCHED_LOG_PATH)
+        self._update_stats()
+        if remember_recent:
+            self.recent_questions.append(question_text)
+
+    def _find_question_match(
+        self,
+        question_text: str,
+        *,
+        success_message: str,
+        log_options: list[str] | None = None,
+        remember_recent_unmatched: bool = False,
+    ) -> dict | None:
+        """统一处理题库匹配、题目日志和未命中统计。"""
+        match = self.matcher.find_answer(question_text, config.FUZZY_MATCH_THRESHOLD)
+        options_for_log = log_options if log_options is not None else (match.get("options", []) if match else [])
+        self._log_question_and_options_once(question_text, options_for_log)
+        if not match:
+            self._handle_unmatched_question(question_text, remember_recent=remember_recent_unmatched)
+            return None
+
+        self._log_match_success_once(
+            question_text,
+            success_message.format(score=match["score"], answer=match["answer"]),
+        )
+        return match
+
+    def _resolve_doubao_answer_index(
+        self,
+        question_text: str,
+        options: list[str],
+        screenshot: np.ndarray,
+        calc: RegionCalculator,
+        match: dict,
+    ) -> int | None:
+        """优先使用豆包选项，失败时回退本地选项识别。"""
+        answer_index = -1
+        if options and len(options) >= len(config.ANSWER_REGIONS):
+            answer_index = self._select_answer_index(options, match["answer"], question_text)
+        else:
+            self._debug_log(
+                f"豆包选项数量不足：{len(options)}/{len(config.ANSWER_REGIONS)}，回退本地选项识别"
+            )
+
+        if answer_index != -1:
+            return answer_index
+
+        fallback_index = self._find_answer_option(screenshot, calc, match)
+        if fallback_index is not None:
+            return fallback_index
+
+        self.gui.log("未在识别的选项中找到答案，本轮不点击，等待下轮继续识别...")
+        return None
+
+    def _resolve_ocr_answer_index(
+        self,
+        question_text: str,
+        screenshot: np.ndarray,
+        calc: RegionCalculator,
+        match: dict,
+    ) -> tuple[int, np.ndarray] | None:
+        """通过本地 OCR 解析答案索引，并按配置重试。"""
+        retry_count = getattr(config, "OPTION_OCR_RETRY_COUNT", 0)
+        retry_delay = getattr(config, "OPTION_OCR_RETRY_DELAY", 0.0)
+        retry_count = max(0, min(int(retry_count), 5))
+
+        current_screenshot = screenshot
+        for attempt in range(retry_count + 1):
+            click_index = self._find_answer_option(current_screenshot, calc, match)
+            if click_index is not None:
+                return click_index, current_screenshot
+
+            if attempt < retry_count:
+                self.gui.log("选项识别不完整/不确定，等待后重试...")
+                time.sleep(retry_delay)
+                current_screenshot = self.window_mgr.capture_window()
+                if current_screenshot is None:
+                    self.gui.log("截图失败")
+                    self.recent_questions.append(question_text)
+                    return None
+
+        # 选项区域可能被弹窗/动画遮挡，或者 OCR 暂时不稳定。
+        # 此时不要把题目加入 recent_questions，也不要计入 total，
+        # 让下一轮 tick 继续识别同一题直到点成功或题目变化。
+        self.gui.log("未找到对应选项，本轮不点击，等待下轮继续识别...")
+        return None
+
+    def _advance_resolved_answer(
+        self,
+        question_text: str,
+        frame_hash: str,
+        question_text_key: str,
+        answer_index: int,
+        screenshot: np.ndarray,
+        calc: RegionCalculator,
+    ):
+        """统一处理答案索引纠正与状态机推进。"""
+        resolved_index = self._resolve_pending_answer_index(
+            frame_hash,
+            question_text_key,
+            answer_index,
+            screenshot,
+            calc,
+        )
+        self._advance_answer_state(
+            question_text,
+            frame_hash,
+            question_text_key,
+            resolved_index,
+            screenshot,
+            calc,
+        )
+
+    def _recognize_question_text_with_ocr(self, screenshot: np.ndarray, calc: RegionCalculator) -> str:
+        """识别当前题目的文本内容。"""
+        q_region = calc.get_pixel_region(config.QUESTION_REGION)
+        q_image = crop_region(screenshot, *q_region)
+        q_image_processed = preprocess_for_ocr(q_image, config.PREPROCESSING_SCALE_FACTOR)
+        q_conf = getattr(config, "OCR_QUESTION_CONFIDENCE_THRESHOLD", config.OCR_CONFIDENCE_THRESHOLD)
+        return self.ocr_engine.recognize_text(q_image_processed, q_conf)
+
+    def _click_answer_without_second_stage(
+        self,
+        question_text: str,
+        answer_index: int,
+        calc: RegionCalculator,
+    ):
+        """二阶段确认关闭时，直接点击答案并结算。"""
+        click_x, click_y = calc.get_click_point(config.ANSWER_REGIONS[answer_index])
+        self._log_answer_click(answer_index)
+        self.clicker.click_at(click_x, click_y, self.window_mgr.hwnd)
+        self.total += 1
+        self.matched += 1
+        self.recent_questions.append(question_text)
+        self._update_stats()
 
     def _log_question_and_options_once(self, question_text: str, options: list[str]):
         """同一道题在本次运行中只输出一次题目和选项。"""
@@ -1416,7 +1753,7 @@ class QuizBot:
         for idx, option in enumerate(options[:len(config.ANSWER_REGIONS)]):
             option_text = str(option).strip()
             if option_text:
-                self.gui.log(f"  选项{chr(65 + idx)}: {option_text}")
+                self.gui.log(f"  选项{self._answer_label(idx)}: {option_text}")
 
     def _log_match_success_once(self, question_text: str, message: str):
         """同一道题在本次运行中只输出一次匹配成功日志。"""
@@ -1430,32 +1767,19 @@ class QuizBot:
 
     def _log_answer_click(self, answer_index: int):
         """Log the answer click."""
-        self.gui.log(f"点击选项 {chr(65 + answer_index)}")
+        self.gui.log(f"点击选项 {self._answer_label(answer_index)}")
+
+    def _answer_label(self, answer_index: int) -> str:
+        """返回选项索引对应的字母标签。"""
+        if 0 <= answer_index < len(config.ANSWER_REGIONS):
+            return chr(65 + answer_index)
+        return f"?{answer_index}"
 
     def _build_question_log_key(self, frame_hash: str, question_text: str) -> str:
         """为当前题目构造稳定的日志去重键。"""
         if frame_hash:
             return frame_hash
         return QuestionMatcher._clean_text(question_text)
-
-    def _wait_for_question_change(self, previous_hash: str, calc: RegionCalculator, timeout_s: float) -> bool:
-        """短暂等待题目区域切换到下一题。"""
-        if not previous_hash:
-            return False
-
-        deadline = time.time() + max(0.2, timeout_s)
-        poll_interval = max(0.05, float(getattr(config, "SECOND_STAGE_CONFIRM_POLL_INTERVAL", 0.12)))
-        while time.time() < deadline:
-            time.sleep(poll_interval)
-            current = self.window_mgr.capture_window()
-            if current is None:
-                continue
-
-            current_hash = self._get_doubao_frame_hash(current, calc)
-            if current_hash and not self._is_same_doubao_frame(previous_hash, current_hash):
-                return True
-
-        return False
 
     def _did_answer_region_change(
         self,
@@ -1483,35 +1807,91 @@ class QuizBot:
         answer_index: int,
         calc: RegionCalculator,
     ) -> bool:
-        """通过当前帧里答案行的金色边框样式判断是否已处于选中态。"""
-        x, y, w, h = calc.get_pixel_region(config.ANSWER_REGIONS[answer_index])
-        crop = crop_region(current, x, y, w, h)
-        if crop.size == 0:
+        """通过答案区域的金边和相对亮度特征判断选项是否已选中。"""
+        option_stats = self._get_answer_option_visual_stats(current, calc)
+        if not (0 <= answer_index < len(option_stats)):
             return False
 
-        hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
-        gold_mask = cv2.inRange(hsv, np.array([10, 70, 120]), np.array([45, 255, 255]))
-        gold_ratio = float(np.count_nonzero(gold_mask)) / gold_mask.size
-
-        border_mask = np.zeros_like(gold_mask)
-        border_w = max(3, w // 12)
-        border_h = max(3, h // 8)
-        border_mask[:border_h, :] = 255
-        border_mask[-border_h:, :] = 255
-        border_mask[:, :border_w] = 255
-        border_mask[:, -border_w:] = 255
-        border_pixels = max(1, int(np.count_nonzero(border_mask)))
-        gold_border_ratio = float(np.count_nonzero(cv2.bitwise_and(gold_mask, border_mask))) / border_pixels
-        value_mean = float(hsv[:, :, 2].mean())
+        current_stats = option_stats[answer_index]
+        if not current_stats:
+            return False
 
         min_gold_ratio = float(getattr(config, "SECOND_STAGE_SELECTED_MIN_GOLD_RATIO", 0.004))
         min_gold_border_ratio = float(getattr(config, "SECOND_STAGE_SELECTED_MIN_GOLD_BORDER_RATIO", 0.012))
         min_value_mean = float(getattr(config, "SECOND_STAGE_SELECTED_MIN_VALUE_MEAN", 145.0))
-        return (
-            gold_ratio >= min_gold_ratio
-            and gold_border_ratio >= min_gold_border_ratio
-            and value_mean >= min_value_mean
+        gold_selected = (
+            current_stats["gold_ratio"] >= min_gold_ratio
+            and current_stats["gold_border_ratio"] >= min_gold_border_ratio
+            and current_stats["value_mean"] >= min_value_mean
         )
+        if gold_selected:
+            return True
+
+        other_stats = [stats for idx, stats in enumerate(option_stats) if idx != answer_index and stats]
+        if not other_stats:
+            return False
+
+        max_other_value_mean = max(stats["value_mean"] for stats in other_stats)
+        max_other_bright_ratio = max(stats["bright_ratio"] for stats in other_stats)
+        max_other_low_sat_ratio = max(stats["low_sat_ratio"] for stats in other_stats)
+
+        min_relative_value_mean = float(getattr(config, "SECOND_STAGE_SELECTED_RELATIVE_MIN_VALUE_MEAN", 150.0))
+        min_relative_bright_ratio = float(getattr(config, "SECOND_STAGE_SELECTED_RELATIVE_MIN_BRIGHT_RATIO", 0.35))
+        min_relative_low_sat_ratio = float(getattr(config, "SECOND_STAGE_SELECTED_RELATIVE_MIN_LOW_SAT_RATIO", 0.40))
+        min_value_margin = float(getattr(config, "SECOND_STAGE_SELECTED_RELATIVE_VALUE_MARGIN", 12.0))
+        min_bright_margin = float(getattr(config, "SECOND_STAGE_SELECTED_RELATIVE_BRIGHT_MARGIN", 0.18))
+        min_low_sat_margin = float(getattr(config, "SECOND_STAGE_SELECTED_RELATIVE_LOW_SAT_MARGIN", 0.18))
+
+        return (
+            current_stats["value_mean"] >= min_relative_value_mean
+            and current_stats["bright_ratio"] >= min_relative_bright_ratio
+            and current_stats["low_sat_ratio"] >= min_relative_low_sat_ratio
+            and (current_stats["value_mean"] - max_other_value_mean) >= min_value_margin
+            and (current_stats["bright_ratio"] - max_other_bright_ratio) >= min_bright_margin
+            and (current_stats["low_sat_ratio"] - max_other_low_sat_ratio) >= min_low_sat_margin
+        )
+
+    def _get_answer_option_visual_stats(
+        self,
+        current: np.ndarray,
+        calc: RegionCalculator,
+    ) -> list[dict]:
+        """提取四个选项的视觉统计特征，供选中态兜底判断使用。"""
+        option_stats: list[dict] = []
+        for region_config in config.ANSWER_REGIONS:
+            x, y, w, h = calc.get_pixel_region(region_config)
+            crop = crop_region(current, x, y, w, h)
+            if crop.size == 0:
+                option_stats.append({})
+                continue
+
+            hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
+            gold_mask = cv2.inRange(hsv, np.array([10, 70, 120]), np.array([45, 255, 255]))
+            gold_ratio = float(np.count_nonzero(gold_mask)) / gold_mask.size
+
+            border_mask = np.zeros_like(gold_mask)
+            border_w = max(3, w // 12)
+            border_h = max(3, h // 8)
+            border_mask[:border_h, :] = 255
+            border_mask[-border_h:, :] = 255
+            border_mask[:, :border_w] = 255
+            border_mask[:, -border_w:] = 255
+            border_pixels = max(1, int(np.count_nonzero(border_mask)))
+            gold_border_ratio = float(np.count_nonzero(cv2.bitwise_and(gold_mask, border_mask))) / border_pixels
+
+            value_channel = hsv[:, :, 2]
+            sat_channel = hsv[:, :, 1]
+            option_stats.append(
+                {
+                    "gold_ratio": gold_ratio,
+                    "gold_border_ratio": gold_border_ratio,
+                    "value_mean": float(value_channel.mean()),
+                    "bright_ratio": float(np.count_nonzero(value_channel >= 150)) / value_channel.size,
+                    "low_sat_ratio": float(np.count_nonzero(sat_channel <= 90)) / sat_channel.size,
+                }
+            )
+
+        return option_stats
 
     def _log_pending_answer_debug_once(
         self,
@@ -1525,11 +1905,17 @@ class QuizBot:
         question_key = frame_hash or question_text_key or ""
         if not question_key:
             return
-        log_key = f"{tag}:{question_key}:{answer_index}"
+        log_key = f"{self._pending_answer_state.name}:{tag}:{question_key}:{answer_index}"
         if log_key in self._seen_pending_answer_debug_keys:
             return
         self._seen_pending_answer_debug_keys.add(log_key)
-        self.gui.log(message)
+        self._debug_log(message)
+
+    def _debug_log(self, message: str):
+        """统一输出调试日志，便于集中开关和格式控制。"""
+        if not getattr(config, "DEBUG_LOGS", True):
+            return
+        self.gui.log(f"[调试] {message}")
 
     def _get_fixed_confirm_region_config(self, answer_index: int) -> dict | None:
         """返回指定选项对应的固定确认区域配置。"""
@@ -1563,7 +1949,7 @@ class QuizBot:
             getattr(
                 config,
                 "SECOND_STAGE_CONFIRM_TEMPLATE_PATHS",
-                [r"D:\develop\yys_dati\data\confirm_template.png"],
+                [str(Path(config.DATA_DIR) / "confirm_template.png")],
             )
         )
         loaded_templates: list[np.ndarray] = []
@@ -1679,7 +2065,7 @@ class QuizBot:
                 try:
                     idx = options.index(answer_alias)
                     if idx < len(config.ANSWER_REGIONS):
-                        self.gui.log(f"閫氳繃棰樺簱绱㈠紩瀹氫綅閫夐」 {chr(65 + idx)}")
+                        self.gui.log(f"通过题库索引定位选项 {self._answer_label(idx)}")
                         return idx
                 except ValueError:
                     continue
@@ -1689,13 +2075,13 @@ class QuizBot:
                     break
                 option_normalized = self._build_answer_forms(option)["normalized"]
                 if option_normalized and option_normalized in normalized_aliases:
-                    self.gui.log(f"閫氳繃棰樺簱鍒悕瀹氫綅閫夐」 {chr(65 + idx)}")
+                    self.gui.log(f"通过题库别名定位选项 {self._answer_label(idx)}")
                     return idx
 
             try:
                 idx = options.index(correct_answer)
                 if idx < len(config.ANSWER_REGIONS):
-                    self.gui.log(f"通过题库索引定位选项 {chr(65 + idx)}")
+                    self.gui.log(f"通过题库索引定位选项 {self._answer_label(idx)}")
                     return idx
             except ValueError:
                 pass
@@ -1770,13 +2156,13 @@ class QuizBot:
             return best_i
 
         if best_score >= config.ANSWER_MATCH_THRESHOLD - 8 and (best_score - second_score) >= 12:
-            self.gui.log(f"低分兜底：最佳分={best_score:.1f}，次佳分={second_score:.1f}，仍选择 {chr(65 + best_i)}")
+            self.gui.log(f"低分兜底：最佳分={best_score:.1f}，次佳分={second_score:.1f}，仍选择 {self._answer_label(best_i)}")
             return best_i
 
         special_index = self._select_percentage_numeric_fallback(options, correct_answer, question_text)
         if special_index != -1:
             self.gui.log(
-                f"百分比答案兼容：题库答案={correct_answer}，回退选择 {chr(65 + special_index)}"
+                f"百分比答案兼容：题库答案={correct_answer}，回退选择 {self._answer_label(special_index)}"
             )
             return special_index
 
@@ -1860,6 +2246,9 @@ class QuizBot:
                     continue
                 if opt == ans:
                     return 100.0
+                # 对于短答案（1-2个字），如果选项包含答案但不等于答案，降低分数
+                if len(ans) <= 2 and ans in opt and opt != ans:
+                    return 50.0
                 if len(opt) >= 2 and len(ans) >= 2 and (opt in ans or ans in opt):
                     return 96.0
 
@@ -2200,8 +2589,12 @@ def main():
         threading.Thread(target=worker, daemon=True).start()
 
     def handle_start():
+        selected_window = gui.get_selected_window()
+        if not selected_window:
+            gui.log("请先选择 MuMu 窗口")
+            return
         bot.set_mumu_adb_path(gui.get_mumu_adb_path() or bot.detect_mumu_adb_path())
-        bot.configure_runtime_targets(gui.get_selected_window())
+        bot.configure_runtime_targets(selected_window)
         bot.start()
 
     def handle_auto_detect_mumu_adb_path():

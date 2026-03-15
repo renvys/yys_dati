@@ -1,8 +1,8 @@
 """GUI 界面模块 - tkinter 图形界面"""
 
+import time
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, ttk
-import time
 
 
 class AppWindow:
@@ -14,13 +14,12 @@ class AppWindow:
         self.root.geometry("760x560")
         self.root.resizable(True, True)
 
-        # 状态
         self.running = False
-        self.on_start = None   # 外部回调：开始
-        self.on_stop = None    # 外部回调：停止
+        self.on_start = None
+        self.on_stop = None
         self.on_auto_detect_mumu_adb_path = None
+        self.on_refresh_instances = None
 
-        # 统计
         self.total_count = 0
         self.matched_count = 0
         self.unmatched_count = 0
@@ -30,63 +29,77 @@ class AppWindow:
 
         self._last_log_message = None
         self._last_log_repeat_count = 0
-        self.on_refresh_instances = None
         self._window_choices: dict[str, dict | None] = {}
-        self._default_window_label = "自动匹配窗口"
         self.mumu_adb_path_var = tk.StringVar()
 
         self._build_ui()
 
     def _build_ui(self):
         """构建界面元素。"""
-        # ---- 主容器 ----
         main_frame = tk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
         left_frame = tk.Frame(main_frame)
         left_frame.pack(fill=tk.BOTH, expand=True)
 
-        # ---- 控制区 ----
         ctrl_frame = tk.Frame(left_frame)
         ctrl_frame.pack(fill=tk.X, padx=10, pady=5)
 
         self.start_btn = tk.Button(
-            ctrl_frame, text="▶ 开始", command=self._toggle,
-            width=12, height=2, font=("Microsoft YaHei", 10, "bold"),
-            bg="#4CAF50", fg="white",
+            ctrl_frame,
+            text="▶ 开始",
+            command=self._toggle,
+            width=12,
+            height=2,
+            font=("Microsoft YaHei", 10, "bold"),
+            bg="#4CAF50",
+            fg="white",
+            state=tk.DISABLED,
         )
         self.start_btn.pack(side=tk.LEFT, padx=5)
 
         self.status_label = tk.Label(
-            ctrl_frame, text="状态: 已停止", fg="red",
+            ctrl_frame,
+            text="状态: 已停止",
+            fg="red",
             font=("Microsoft YaHei", 10),
         )
         self.status_label.pack(side=tk.LEFT, padx=15)
 
-        instance_frame = tk.LabelFrame(
-            left_frame, text="MuMu 实例", font=("Microsoft YaHei", 9),
-        )
+        instance_frame = tk.LabelFrame(left_frame, text="MuMu 实例", font=("Microsoft YaHei", 9))
         instance_frame.pack(fill=tk.X, padx=10, pady=5)
 
         path_row = tk.Frame(instance_frame)
         path_row.pack(fill=tk.X, padx=6, pady=(6, 3))
 
         tk.Label(
-            path_row, text="ADB路径:", width=8, anchor="w", font=("Microsoft YaHei", 9),
+            path_row,
+            text="ADB路径:",
+            width=8,
+            anchor="w",
+            font=("Microsoft YaHei", 9),
         ).pack(side=tk.LEFT)
         self.path_entry = tk.Entry(
-            path_row, textvariable=self.mumu_adb_path_var, font=("Consolas", 9),
+            path_row,
+            textvariable=self.mumu_adb_path_var,
+            font=("Consolas", 9),
         )
         self.path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self.auto_path_btn = tk.Button(
-            path_row, text="自动", width=6, command=self._auto_detect_mumu_adb_path,
+            path_row,
+            text="自动",
+            width=6,
+            command=self._auto_detect_mumu_adb_path,
             font=("Microsoft YaHei", 9),
         )
         self.auto_path_btn.pack(side=tk.LEFT, padx=(6, 0))
 
         self.browse_path_btn = tk.Button(
-            path_row, text="浏览", width=6, command=self._browse_mumu_adb_path,
+            path_row,
+            text="浏览",
+            width=6,
+            command=self._browse_mumu_adb_path,
             font=("Microsoft YaHei", 9),
         )
         self.browse_path_btn.pack(side=tk.LEFT, padx=(6, 0))
@@ -95,23 +108,29 @@ class AppWindow:
         window_row.pack(fill=tk.X, padx=6, pady=(3, 6))
 
         tk.Label(
-            window_row, text="窗口:", width=8, anchor="w", font=("Microsoft YaHei", 9),
+            window_row,
+            text="窗口:",
+            width=8,
+            anchor="w",
+            font=("Microsoft YaHei", 9),
         ).pack(side=tk.LEFT)
         self.window_combo = ttk.Combobox(
-            window_row, state="readonly", font=("Microsoft YaHei", 9),
+            window_row,
+            state="disabled",
+            font=("Microsoft YaHei", 9),
         )
         self.window_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         self.refresh_btn = tk.Button(
-            window_row, text="刷新", width=8, command=self._refresh_instances,
+            window_row,
+            text="刷新",
+            width=8,
+            command=self._refresh_instances,
             font=("Microsoft YaHei", 9),
         )
         self.refresh_btn.pack(side=tk.LEFT, padx=(6, 0))
 
-        # ---- 统计区 ----
-        stats_frame = tk.LabelFrame(
-            left_frame, text="统计", font=("Microsoft YaHei", 9),
-        )
+        stats_frame = tk.LabelFrame(left_frame, text="统计", font=("Microsoft YaHei", 9))
         stats_frame.pack(fill=tk.X, padx=10, pady=5)
 
         self.stats_label = tk.Label(
@@ -121,23 +140,23 @@ class AppWindow:
         )
         self.stats_label.pack(padx=5, pady=5)
 
-        # ---- 日志区 ----
-        log_frame = tk.LabelFrame(
-            left_frame, text="运行日志", font=("Microsoft YaHei", 9),
-        )
+        log_frame = tk.LabelFrame(left_frame, text="运行日志", font=("Microsoft YaHei", 9))
         log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
         self.log_text = scrolledtext.ScrolledText(
-            log_frame, height=18, state=tk.DISABLED,
-            font=("Consolas", 9), wrap=tk.WORD,
+            log_frame,
+            height=18,
+            state=tk.DISABLED,
+            font=("Consolas", 9),
+            wrap=tk.WORD,
         )
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # ---- 底部提示 ----
         tip_label = tk.Label(
             left_frame,
             text="提示: 将鼠标移到屏幕左上角可紧急停止 | 请先调整 config.py 中的区域坐标",
-            font=("Microsoft YaHei", 8), fg="gray",
+            font=("Microsoft YaHei", 8),
+            fg="gray",
         )
         tip_label.pack(pady=3)
 
@@ -150,10 +169,13 @@ class AppWindow:
 
     def start(self):
         """开始运行。"""
+        if not self.get_selected_window():
+            return
+
         self.running = True
         self.elapsed_seconds = 0
         self._run_started_at = time.time()
-        self.start_btn.config(text="■ 停止", bg="#f44336")
+        self.start_btn.config(text="■ 停止", bg="#f44336", state=tk.NORMAL)
         self.refresh_btn.config(state=tk.DISABLED)
         self.auto_path_btn.config(state=tk.DISABLED)
         self.browse_path_btn.config(state=tk.DISABLED)
@@ -179,9 +201,10 @@ class AppWindow:
         self.auto_path_btn.config(state=tk.NORMAL)
         self.browse_path_btn.config(state=tk.NORMAL)
         self.path_entry.config(state=tk.NORMAL)
-        self.window_combo.config(state="readonly")
+        self.window_combo.config(state="readonly" if self._has_window_choices() else "disabled")
         self.status_label.config(text="状态: 已停止", fg="red")
         self._refresh_stats()
+        self._update_start_button_state()
         if self.on_stop:
             self.on_stop()
 
@@ -235,11 +258,11 @@ class AppWindow:
             self._refresh_stats()
 
     def update_preview(self, pil_image, info_text: str = ""):
-        """预览面板已移除，保留空接口以兼容主流程调用。"""
+        """预览面板已移除，保留空接口兼容主流程调用。"""
         return
 
     def set_refreshing(self, refreshing: bool):
-        """更新实例刷新按钮状态，避免主线程卡顿时用户重复点击。"""
+        """更新实例刷新按钮状态，避免刷新期间重复点击。"""
         self.root.after(0, self._set_refreshing, refreshing)
 
     def _set_refreshing(self, refreshing: bool):
@@ -249,16 +272,19 @@ class AppWindow:
 
         if refreshing:
             self.refresh_btn.config(text="刷新中", state=tk.DISABLED)
+            self.start_btn.config(state=tk.DISABLED)
             self.auto_path_btn.config(state=tk.DISABLED)
             self.browse_path_btn.config(state=tk.DISABLED)
             self.path_entry.config(state=tk.DISABLED)
             self.window_combo.config(state="disabled")
-        else:
-            self.refresh_btn.config(text="刷新", state=tk.NORMAL)
-            self.auto_path_btn.config(state=tk.NORMAL)
-            self.browse_path_btn.config(state=tk.NORMAL)
-            self.path_entry.config(state=tk.NORMAL)
-            self.window_combo.config(state="readonly")
+            return
+
+        self.refresh_btn.config(text="刷新", state=tk.NORMAL)
+        self.auto_path_btn.config(state=tk.NORMAL)
+        self.browse_path_btn.config(state=tk.NORMAL)
+        self.path_entry.config(state=tk.NORMAL)
+        self.window_combo.config(state="readonly" if self._has_window_choices() else "disabled")
+        self._update_start_button_state()
 
     def set_target_choices(
         self,
@@ -266,10 +292,10 @@ class AppWindow:
         selected_window_title: str = "",
     ):
         """更新 MuMu 窗口候选列表。"""
-        self._window_choices = {self._default_window_label: None}
-        window_labels = [self._default_window_label]
+        self._window_choices = {}
+        window_labels: list[str] = []
+        preferred_window_label = ""
 
-        preferred_window_label = self._default_window_label
         for window in windows:
             label = self._format_window_label(window)
             self._window_choices[label] = window
@@ -278,7 +304,16 @@ class AppWindow:
                 preferred_window_label = label
 
         self.window_combo["values"] = window_labels
-        self.window_combo.set(preferred_window_label)
+        if preferred_window_label:
+            self.window_combo.set(preferred_window_label)
+        elif window_labels:
+            self.window_combo.set(window_labels[0])
+        else:
+            self.window_combo.set("")
+
+        if not self.running:
+            self.window_combo.config(state="readonly" if self._has_window_choices() else "disabled")
+        self._update_start_button_state()
 
     def get_selected_window(self) -> dict | None:
         """返回当前选择的窗口实例。"""
@@ -310,6 +345,14 @@ class AppWindow:
         )
         if path:
             self.set_mumu_adb_path(path)
+
+    def _has_window_choices(self) -> bool:
+        return bool(self._window_choices)
+
+    def _update_start_button_state(self):
+        if self.running:
+            return
+        self.start_btn.config(state=tk.NORMAL if self.get_selected_window() else tk.DISABLED)
 
     @staticmethod
     def _format_window_label(window: dict) -> str:

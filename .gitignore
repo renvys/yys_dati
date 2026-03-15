@@ -2,24 +2,22 @@
 .claude/
 AGENTS.md
 CLAUDE.md
-题库5.1(使用这个题库!!!).xlsx
+*.xlsx
+secrets.json
+
 __pycache__/
 **/__pycache__/
 *.pyc
 *.pyo
 
-debug_*.py
+tools/debug/
 
 runtime_stdout.log
 runtime_stderr.log
-
 nul
-
-data/*.png
-data/*_report.json
-data/confirm_mask.png
 data/unmatched.log
-data/*.log
+build/
+dist/
 
 !data/question_bank.json
 !data/confirm_templates/
