@@ -2615,6 +2615,8 @@ def main():
     gui.log("阴阳师答题器已就绪")
     gui.log(f"监控窗口关键词: {config.WINDOW_TITLE_KEYWORDS}")
     gui.log("点击「开始」按钮启动答题")
+    if getattr(config, "SECRETS_WARNING", ""):
+        gui.log(config.SECRETS_WARNING)
     detected_mumu_adb_path = bot.detect_mumu_adb_path()
     if detected_mumu_adb_path:
         bot.set_mumu_adb_path(detected_mumu_adb_path)

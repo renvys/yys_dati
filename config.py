@@ -1,6 +1,7 @@
 """阴阳师答题器全局配置。"""
 
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -29,24 +30,62 @@ def _get_data_dir(runtime_root: Path) -> Path:
     return candidates[0]
 
 
+def _find_runtime_file(filename: str) -> Path:
+    """在运行目录及打包临时目录中查找附带文件。"""
+    runtime_root = _get_runtime_root()
+    candidates = [runtime_root / filename]
+    bundle_root = getattr(sys, "_MEIPASS", "")
+    if bundle_root:
+        candidates.append(Path(bundle_root) / filename)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    return candidates[0]
+
+
 PROJECT_ROOT = _get_runtime_root()
 DATA_DIR = _get_data_dir(PROJECT_ROOT)
+SECRETS_PATH = PROJECT_ROOT / "secrets.json"
+SECRETS_EXAMPLE_PATH = _find_runtime_file("secrets.json.example")
+SECRETS_WARNING = ""
 
 
 def _load_secrets() -> dict:
-    """从 secrets.json 加载敏感配置。"""
-    secrets_path = PROJECT_ROOT / "secrets.json"
-    if not secrets_path.exists():
-        raise FileNotFoundError(
-            f"配置文件不存在: {secrets_path}\n"
-            f"请复制 secrets.json.example 为 secrets.json 并填入你的 API key"
-        )
+    """从 secrets.json 加载敏感配置；缺失时返回空配置。"""
+    global SECRETS_WARNING
+
+    if not SECRETS_PATH.exists():
+        if SECRETS_EXAMPLE_PATH.exists():
+            try:
+                shutil.copyfile(SECRETS_EXAMPLE_PATH, SECRETS_PATH)
+                SECRETS_WARNING = (
+                    f"已自动创建配置模板: {SECRETS_PATH}，"
+                    "请按需填入豆包 API key；当前若未填写将自动回退传统 OCR。"
+                )
+            except OSError:
+                SECRETS_WARNING = (
+                    f"配置文件不存在: {SECRETS_PATH}；"
+                    f"可复制 {SECRETS_EXAMPLE_PATH.name} 为 secrets.json 并填入豆包 API key。"
+                )
+                return {}
+        else:
+            SECRETS_WARNING = (
+                f"配置文件不存在: {SECRETS_PATH}；"
+                "当前若未配置豆包 API key，将自动回退传统 OCR。"
+            )
+            return {}
 
     try:
-        with open(secrets_path, "r", encoding="utf-8") as f:
+        with open(SECRETS_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
     except json.JSONDecodeError as e:
-        raise ValueError(f"配置文件格式错误: {e}")
+        SECRETS_WARNING = (
+            f"配置文件格式错误: {SECRETS_PATH} ({e})；"
+            "当前若未配置豆包 API key，将自动回退传统 OCR。"
+        )
+        return {}
 
 
 _SECRETS = _load_secrets()
